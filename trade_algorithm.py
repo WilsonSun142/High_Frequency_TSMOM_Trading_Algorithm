@@ -46,7 +46,7 @@ PRINT_EVERY = 2.0
 MIN_PLACE_GAP = 10.0
 AUTO_FLIP   = False
 ALLOW_SHORT = True
-DRY_RUN     = False
+DRY_RUN     = True
 ACCOUNT_ID  = None               # e.g., 'DU1234567' if needed
 
 # ========= INSTRUMENT SELECTION =========
