@@ -1,4 +1,4 @@
-# trade_algorithm_tsmom_multistock.py
+# trade_algorithm.py
 # EDUCATIONAL PURPOSES ONLY — USE IBKR PAPER TRADING
 
 from __future__ import annotations
@@ -7,7 +7,7 @@ import numpy as np
 import time, signal
 from collections import deque, defaultdict
 from datetime import datetime
-import pytz
+import pytz, math
 
 # ========= CONNECTION =========
 HOST, PORT, CLIENT_ID = '127.0.0.1', 7497, 909
@@ -15,37 +15,38 @@ HOST, PORT, CLIENT_ID = '127.0.0.1', 7497, 909
 # ========= SLEEVE / RISK =========
 HFT_SLEEVE_USD          = 150_000
 PER_TRADE_RISK_USD      = 60
-DAILY_LOSS_LIMIT        = -0.01 * HFT_SLEEVE_USD
+DAILY_LOSS_LIMIT        = -0.01 * HFT_SLEEVE_USD   # applies to *session* PnL once armed
 OPEN_NOTIONAL_MAX       = 150_000
 
 # ========= COST / TURNOVER GUARDS =========
-DRY_RUN                 = True
-MIN_SECONDS_BETWEEN_TR  = 8.0          # per symbol
-MAX_TRADES_PER_MIN_SYM  = 3            # per symbol
-SPREAD_SKIP_TICKS       = 2.0          # skip if spread > 2 ticks ($0.02)
-TICK                    = 0.01
-PER_TRADE_NOTIONAL_MAX  = 10_000
-MAX_SHARES_PER_TRADE    = 3000
+DRY_RUN                 = False                     # set False to place paper orders
+MIN_SECONDS_BETWEEN_TR  = 8.0                       # per symbol (entries only)
+MAX_TRADES_PER_MIN_SYM  = 3                         # per symbol (entries only)
+SPREAD_SKIP_TICKS       = 50.0                      # relaxed while on delayed quotes
+DEFAULT_TICK            = 0.01
+PER_TRADE_NOTIONAL_MAX  = 2_000                    # per-entry notional cap (tight for testing)
+MAX_SHARES_PER_TRADE    = 2                    # hard cap ~ 1,000 shares
 
 # ========= TSMOM SETTINGS =========
-LOOKBACK_SAMPLES  = 120                # loop sleeps ~0.05s
+LOOKBACK_SAMPLES  = 120
 EWMA_ALPHA        = 0.2
 Z_WINDOW          = 300
 Z_ENTRY           = 1.5
 Z_EXIT            = 0.5
-ALLOW_SHORT       = True
+ALLOW_SHORT       = True                           # <— NO SHORTS
 PRINT_EVERY       = 2.0
+REQUIRE_RTH       = True                            # trade only US regular hours
 
 # ========= UNIVERSE =========
-SYMBOLS      = ['TSLA', 'NVDA', 'AAPL', 'MSFT', 'SPY']
+SYMBOLS      = ['META', 'AMZN', 'AAPL']
 EXCHANGE, CCY = 'SMART', 'USD'
 
 # ========= TIMEZONE =========
 syd = pytz.timezone('Australia/Sydney')
 def now_syd(): return datetime.now(tz=syd)
 
-# ========= RUN TAG (scopes orders to this execution) =========
-RUN_TAG = f"TSMOM-{int(time.time())}"  # e.g., "TSMOM-173..."; used in orderRef
+# ========= RUN TAG (scopes all our orders) =========
+RUN_TAG = f"TSMOM-{int(time.time())}"
 
 # ========= HELPERS =========
 def size_for_risk_stock(risk_usd, sl_dollars):
@@ -55,13 +56,10 @@ def size_for_risk_stock(risk_usd, sl_dollars):
 def opposite(side): return 'SELL' if side.upper()=='BUY' else 'BUY'
 
 def _is_working(status: str) -> bool:
-    # "Inactive" can appear briefly for children; include Pending states.
     return status in {'Submitted','PreSubmitted','PendingSubmit','ApiPending','PendingCancel','Inactive'}
 
 def our_trades_for(ib: IB, contract: Contract, order_ref_prefix: str):
-    """
-    Return working trades for this contract created by *this run* (orderRef startswith RUN_TAG).
-    """
+    """Return working trades for this contract created by *this run* (orderRef startswith RUN_TAG)."""
     out = []
     for tr in ib.trades():
         try:
@@ -76,30 +74,21 @@ def our_trades_for(ib: IB, contract: Contract, order_ref_prefix: str):
             pass
     return out
 
-def cancel_our_side(ib: IB, contract: Contract, order_ref_prefix: str, side: str):
-    side = side.upper()
+def cancel_ours(ib: IB, contract: Contract, order_ref_prefix: str):
+    """Cancel *our* working orders only (don’t touch manual orders)."""
     for tr in our_trades_for(ib, contract, order_ref_prefix):
         try:
-            if tr.order.action.upper() == side:
-                ib.cancelOrder(tr.order)
+            ib.cancelOrder(tr.order)
         except Exception:
             pass
 
-def flatten_ours(ib: IB, contract: Contract, qty: int, side: str, order_ref_prefix: str, dry_run: bool):
-    """
-    Close *our* exposure only:
-      1) cancel our working orders on the closing side,
-      2) send a market order with our orderRef to offset our position.
-    """
-    side = side.upper()
-    cancel_our_side(ib, contract, order_ref_prefix, side)
-    ib.sleep(0.25)
-    if dry_run:
-        print(f"[DRY] Flatten ours via {side} {qty}")
-        return
-    mkt = MarketOrder(side, qty)
-    mkt.orderRef = order_ref_prefix + ":FLAT"
-    ib.placeOrder(contract, mkt)
+# ========= OUR-POSITION TRACKING (by orderRef) =========
+# We track *this run’s* filled quantity per symbol so we can exit only what we opened.
+our_pos: dict[str, int] = defaultdict(int)
+
+def _botorbuy(side: str) -> bool:
+    s = (side or '').upper()
+    return s in ('BOT', 'BUY')
 
 # ========= SIGNAL: TSMOM =========
 class ReturnMomentum:
@@ -116,26 +105,26 @@ class ReturnMomentum:
             return None
         m_now  = prices[-1]
         m_then = prices[-(self.lookback+1)]
-        r = np.log(m_now) - np.log(m_then)
+        if m_now <= 0 or m_then <= 0:
+            return None
+        r = math.log(m_now) - math.log(m_then)
         self.ewma_ret = r if self.ewma_ret is None else (1-self.alpha)*self.ewma_ret + self.alpha*r
         self.hist.append(self.ewma_ret)
         if len(self.hist) > self.z_window:
             self.hist = self.hist[-self.z_window:]
-        mu = float(np.mean(self.hist))
+        mu = float(np.mean(self.hist)) if self.hist else 0.0
         sd = float(np.std(self.hist)) if len(self.hist) > 1 else 1e-9
-        return (self.ewma_ret - mu) / (sd if sd > 1e-9 else 1.0)
+        z = (self.ewma_ret - mu) / (sd if sd > 1e-9 else 1.0)
+        return z if np.isfinite(z) else None
 
 def tsmom_decision(z):
-    if z is None: return 'HOLD'
+    if z is None or not np.isfinite(z): return 'HOLD'
     if z >= Z_ENTRY: return 'LONG'
-    if ALLOW_SHORT and z <= -Z_ENTRY: return 'SHORT'
-    return 'HOLD'
+    return 'HOLD'  # no shorts
 
 # ========= ORDER HELPERS =========
 def make_bracket(ib: IB, side: str, qty: int, entry: float, tp_cents: float, sl_cents: float, order_ref: str):
-    """
-    Create a parent market + TP limit + SL stop bracket. All three are stamped with orderRef.
-    """
+    """Parent market + TP limit + SL stop bracket. All stamped with orderRef."""
     side = side.upper()
     opp  = opposite(side)
     tp_px = round(entry + (tp_cents/100.0)*(+1 if side=='BUY' else -1), 2)
@@ -145,16 +134,15 @@ def make_bracket(ib: IB, side: str, qty: int, entry: float, tp_cents: float, sl_
     takeProf = LimitOrder(opp, qty, lmtPrice=tp_px, tif='GTC')
     stopLoss = StopOrder(opp, qty, stopPrice=sl_px, tif='GTC')
 
-    # ***** tag orders to this run *****
     for o in (parent, takeProf, stopLoss):
         o.orderRef = order_ref
 
-    parent.orderId   = ib.client.getReqId()
-    takeProf.orderId = ib.client.getReqId()
-    stopLoss.orderId = ib.client.getReqId()
+    parent.orderId    = ib.client.getReqId()
+    takeProf.orderId  = ib.client.getReqId()
+    stopLoss.orderId  = ib.client.getReqId()
     takeProf.parentId = parent.orderId
     stopLoss.parentId = parent.orderId
-    parent.transmit = False
+    parent.transmit   = False
     takeProf.transmit = False
     stopLoss.transmit = True
     return parent, takeProf, stopLoss
@@ -173,7 +161,15 @@ class TurnoverGuard:
         dq.append(now)
         return True
 
-# ========= ROBUST HISTORICAL BACKFILL (HMDS) =========
+# ========= TIME FILTER =========
+def is_rth_newyork():
+    et = pytz.timezone('America/New_York')
+    t  = datetime.now(et)
+    if t.weekday() >= 5:
+        return False
+    return (t.hour, t.minute) >= (9,30) and (t.hour, t.minute) < (16, 0)
+
+# ========= HISTORICAL BACKFILL =========
 def _req_hist(ib: IB, c: Contract, duration: str, bar_size: str, what: str) -> list[float]:
     bars = ib.reqHistoricalData(
         c, endDateTime='', durationStr=duration, barSizeSetting=bar_size,
@@ -189,12 +185,13 @@ def _req_hist(ib: IB, c: Contract, duration: str, bar_size: str, what: str) -> l
 
 def backfill_symbol(ib: IB, c: Contract, need_points: int) -> list[float]:
     attempts = [
-        ('45 M',  '5 secs', 'MIDPOINT'),
-        ('60 M',  '5 secs', 'TRADES'),
-        ('6 H',   '1 min',  'MIDPOINT'),
-        ('6 H',   '1 min',  'TRADES'),
-        ('2 D',   '5 mins', 'MIDPOINT'),
-        ('2 D',   '5 mins', 'TRADES'),
+        ('2700 S',  '5 secs', 'MIDPOINT'),  # 45 min
+        ('3600 S',  '5 secs', 'TRADES'),    # 60 min
+        ('21600 S', '1 min',  'MIDPOINT'),  # 6 hours
+        ('21600 S', '1 min',  'TRADES'),
+        ('2 D',     '5 mins', 'MIDPOINT'),
+        ('2 D',     '5 mins', 'TRADES'),
+        ('1 W',     '5 mins', 'TRADES'),
     ]
     for duration, bar_size, what in attempts:
         try:
@@ -218,7 +215,7 @@ def backfill_all(ib: IB, contracts: dict[str, Contract], mid_buf: dict[str, dequ
         else:
             print(f"  • {s}: no data (will build from live)")
 
-# ========= MARKET DATA (prefer RT → fallback to DELAYED if permitted) =========
+# ========= MARKET DATA =========
 class MarketData:
     def __init__(self, ib: IB, contracts: dict[str, Contract]):
         self.ib = ib
@@ -244,7 +241,6 @@ class MarketData:
         self.ib.reqMarketDataType(1)
         for s, c in self.contracts.items():
             self.tickers[s] = self.ib.reqMktData(c, '', False, False)
-        # Brief wait for RT; if any symbol lacks bid/ask/last, try delayed
         t0 = time.time()
         while time.time() - t0 < 2.0:
             if all((t.bid and t.ask) or t.last or t.close for t in self.tickers.values()):
@@ -257,7 +253,6 @@ class MarketData:
             try: self.ib.cancelMktData(self.tickers[s])
             except Exception: pass
             self.tickers[s] = self.ib.reqMktData(c, '', False, False)
-        # one more short wait
         t1 = time.time()
         ok = False
         while time.time() - t1 < 2.0:
@@ -265,8 +260,7 @@ class MarketData:
                 ok = True; break
             self.ib.sleep(0.1)
         if not ok:
-            # Delayed not enabled in account
-            print("❌ Fatal: no usable market data (RT nor Delayed). Enable market data or Delayed quotes.")
+            print("❌ Fatal: no usable market data (RT nor Delayed). Enable delayed data & API market data.")
             raise RuntimeError("No market data")
 
     def snapshot(self, symbol):
@@ -289,6 +283,15 @@ class MarketData:
             try: self.ib.cancelMktData(t)
             except Exception: pass
 
+# ========= TICK SIZE =========
+def get_tick_size(ib: IB, c: Contract) -> float:
+    try:
+        di = ib.reqContractDetails(c)[0]
+        mn = getattr(di, 'minTick', None)
+        return float(mn) if mn else DEFAULT_TICK
+    except Exception:
+        return DEFAULT_TICK
+
 # ========= MAIN =========
 def main():
     def _sigint(_sig, _frm): raise KeyboardInterrupt()
@@ -296,7 +299,6 @@ def main():
 
     print(f"[{now_syd()}] Connecting to IBKR paper on {HOST}:{PORT} …")
 
-    # Quiet repetitive perms errors (MarketData.start handles switching)
     def _quiet(reqId, code, msg, contract):
         if code in (10168, 354, 10167): return
         print(f"IB ERR {code} (reqId {reqId}): {msg}")
@@ -314,28 +316,83 @@ def main():
         [qc] = ib.qualifyContracts(Stock(s, EXCHANGE, CCY))
         contracts[s] = qc
 
+    # ======== LIVE PnL SUBSCRIPTION (robust) ========
+    pnl_realized = 0.0
+    pnl_unrealized = 0.0
+    daily_pnl = 0.0
+
+    accounts = ib.managedAccounts()
+    if not accounts:
+        try:
+            accounts = [v.account for v in ib.accountValues()]
+        except Exception:
+            accounts = []
+    account_id = accounts[0] if accounts else None
+
+    def _pnl_update(realizedPnL=None, unrealizedPnL=None, dailyPnL=None):
+        nonlocal pnl_realized, pnl_unrealized, daily_pnl
+        if realizedPnL is not None:   pnl_realized = float(realizedPnL)
+        if unrealizedPnL is not None: pnl_unrealized = float(unrealizedPnL)
+        if dailyPnL is not None:      daily_pnl = float(dailyPnL)
+
+    if account_id:
+        def on_pnl(*args):
+            if len(args) == 1 and hasattr(args[0], 'realizedPnL'):
+                pnl_obj = args[0]
+                _pnl_update(
+                    realizedPnL=getattr(pnl_obj, 'realizedPnL', None),
+                    unrealizedPnL=getattr(pnl_obj, 'unrealizedPnL', None),
+                    dailyPnL=getattr(pnl_obj, 'dailyPnL', None),
+                )
+            elif len(args) >= 5:
+                _, _, dailyPnL, unrealizedPnL, realizedPnL = args[:5]
+                _pnl_update(realizedPnL=realizedPnL, unrealizedPnL=unrealizedPnL, dailyPnL=dailyPnL)
+        ib.pnlEvent += on_pnl
+        ib.reqPnL(account_id, '')  # '' => all model codes
+
+    # Tick sizes
+    TICKS = {s: (get_tick_size(ib, c) or DEFAULT_TICK) for s, c in contracts.items()}
+
     # Buffers & models
     mid_buf  = {s: deque(maxlen=max(LOOKBACK_SAMPLES+2, Z_WINDOW+10)) for s in SYMBOLS}
     zmodel   = {s: ReturnMomentum() for s in SYMBOLS}
-    # Position (DRY-RUN shadow only; in live you’d read from IB positions)
-    position = {s: 0 for s in SYMBOLS}
     last_ts  = {s: 0.0 for s in SYMBOLS}
     guard    = TurnoverGuard()
-    pnl_realized = 0.0
     last_log = 0.0
 
-    # Market data (prefer RT → fallback delayed if available)
+    # Market data
     md = MarketData(ib, contracts)
     try:
         md.start()
     except RuntimeError:
-        md.stop()
-        ib.disconnect()
-        return
+        md.stop(); ib.disconnect(); return
 
-    # Backfill so TSMOM can compute immediately (≈ LOOKBACK + Z_WINDOW)
+    # Backfill
     need_points = LOOKBACK_SAMPLES + Z_WINDOW
     backfill_all(ib, contracts, mid_buf, need_points)
+
+    # ---- Kill-switch baseline (armed only after first order/first fill) ----
+    kill_armed = False
+    daily_baseline = 0.0
+
+    # Track our fills (inside main so we can arm kill-switch)
+    def on_exec(_reqId, contract: Contract, execution: Execution):
+        nonlocal kill_armed, daily_baseline
+        ref = getattr(execution, 'orderRef', '') or ''
+        if not ref.startswith(RUN_TAG):
+            return
+        sym = contract.symbol
+        shares = int(execution.shares or 0)
+        if _botorbuy(execution.side):
+            our_pos[sym] += shares
+        else:
+            our_pos[sym] -= shares
+        if not kill_armed:
+            daily_baseline = float(daily_pnl)
+            kill_armed = True
+            print(f"🔒 Kill-switch armed. Session baseline set to {daily_baseline:.2f}")
+
+    ib.execDetailsEvent += on_exec
 
     print(f"RUN_TAG={RUN_TAG}")
     print("Running (Ctrl+C to stop)…")
@@ -343,49 +400,87 @@ def main():
         while True:
             ib.sleep(0.05)
 
-            # heartbeat log
+            if REQUIRE_RTH and not is_rth_newyork():
+                continue
+
+            # Heartbeat
             if time.time() - last_log >= PRINT_EVERY:
                 row = []
                 for s in SYMBOLS:
                     z = zmodel[s].update(list(mid_buf[s])) if len(mid_buf[s]) else None
                     row.append(f"{s}:{(z if z is not None else float('nan')):+.2f}")
-                print(f"[{now_syd()}] " + " | ".join(row) + f" | PnL={pnl_realized:.2f}")
+                extra = ""
+                if kill_armed:
+                    session_daily = daily_pnl - daily_baseline
+                    extra = f" | SessionDaily={session_daily:.2f}"
+                print(f"[{now_syd()}] " + " | ".join(row) +
+                      f" | AccountPnL: Real={pnl_realized:.2f} Unrl={pnl_unrealized:.2f} Daily={daily_pnl:.2f}{extra}")
                 last_log = time.time()
 
             for s in SYMBOLS:
+                # build price history
                 mid, bid, ask = md.snapshot(s)
                 if not mid:
                     continue
                 mid_buf[s].append(mid)
 
-                # spread filter (only if we have bid/ask)
-                if bid and ask:
-                    spread_ticks = (ask - bid)/TICK
+                # spread guard only when realtime
+                if bid and ask and not md.haveDelayed:
+                    tick = TICKS.get(s, DEFAULT_TICK) or DEFAULT_TICK
+                    spread_ticks = (ask - bid)/tick
                     if spread_ticks > SPREAD_SKIP_TICKS:
                         continue
 
                 z = zmodel[s].update(list(mid_buf[s]))
-                sig = tsmom_decision(z)
+                if z is None or len(zmodel[s].hist) < max(20, int(0.2*Z_WINDOW)):
+                    continue
 
-                # cooldown / turnover guard
+                contract = contracts[s]
+                my_qty   = int(our_pos.get(s, 0))    # ONLY our book, not manual
+
+                # === EXIT on neutrality: sell only what we opened ===
+                if my_qty > 0 and abs(z) <= Z_EXIT:
+                    cancel_ours(ib, contract, RUN_TAG)
+                    if DRY_RUN:
+                        print(f"[DRY] FLATTEN {s}: SELL {my_qty} (ours)")
+                    else:
+                        mkt = MarketOrder('SELL', my_qty); mkt.orderRef = f"{RUN_TAG}:FLAT"
+                        ib.placeOrder(contract, mkt)
+                    continue
+
+                # === If model flips to short, just exit longs (no new shorts) ===
+                if my_qty > 0 and z <= -Z_ENTRY:
+                    cancel_ours(ib, contract, RUN_TAG)
+                    if DRY_RUN:
+                        print(f"[DRY] FLATTEN {s}: SELL {my_qty} (ours, flip)")
+                    else:
+                        mkt = MarketOrder('SELL', my_qty); mkt.orderRef = f"{RUN_TAG}:FLIP"
+                        ib.placeOrder(contract, mkt)
+                    continue
+
+                # === Fresh entry only if we don't already hold from this run ===
+                if my_qty != 0:
+                    continue
+                sig = tsmom_decision(z)
+                if sig != 'LONG':   # no shorts
+                    continue
                 if time.time() - last_ts[s] < MIN_SECONDS_BETWEEN_TR:
                     continue
-                if sig == 'HOLD':
-                    # exit rule handled below if already in position
-                    pass
                 if not guard.allow(s):
                     continue
 
-                # simple vol-based TP/SL (in cents)
+                # Vol-based TP/SL (cents)
                 VOL_WIN = 80
                 tp_cents, sl_cents = 4.0, 3.0
-                if len(mid_buf[s]) >= VOL_WIN:
+                if len(mid_buf[s]) >= VOL_WIN + 1:
                     arr = np.array(list(mid_buf[s])[-VOL_WIN:])
-                    vol_ticks = max(0.2, min(3.0, float(np.std(np.diff(arr)))/TICK))
+                    dif = np.diff(arr)
+                    tick = TICKS.get(s, DEFAULT_TICK)
+                    vol_ticks = max(0.2, min(3.0, float(np.std(dif))/max(tick, 1e-6)))
                     tp_cents = max(1.0, min(6.0, 2.0 * vol_ticks))
                     sl_cents = max(1.0, min(5.0, 1.5 * vol_ticks))
 
-                # shares from risk & notional cap
+                # Position sizing
                 sl_dollars = sl_cents/100.0
                 shares_risk = size_for_risk_stock(PER_TRADE_RISK_USD, sl_dollars)
                 shares_notional = max(1, int(PER_TRADE_NOTIONAL_MAX // max(mid, 0.01)))
@@ -393,71 +488,86 @@ def main():
                 if qty < 5:
                     continue
 
-                # sleeve exposure guard (naive per-symbol)
-                open_notional = abs(position[s]) * mid
+                # Sleeve exposure guard (only our book)
+                open_notional = abs(my_qty) * mid
                 if open_notional + qty*mid > OPEN_NOTIONAL_MAX:
                     continue
 
-                state = 'LONG' if position[s] > 0 else ('SHORT' if position[s] < 0 else 'FLAT')
-                order_ref_prefix = RUN_TAG                 # prefix matches our filter
-                order_ref = f"{RUN_TAG}:{s}"               # per-symbol tag
-
-                # Exit on neutrality band — only flatten *ours*
-                if abs(position[s]) > 0 and z is not None and abs(z) <= Z_EXIT:
-                    side_exit = 'SELL' if position[s] > 0 else 'BUY'
-                    qty_exit  = abs(position[s])
-                    flatten_ours(ib, contracts[s], qty_exit, side_exit, order_ref_prefix, DRY_RUN)
-                    position[s] = 0  # DRY bookkeeping
-                    last_ts[s] = time.time()
+                # Place bracket (LONG only)
+                side = 'BUY'
+                order_ref = f"{RUN_TAG}:{s}"
+                if any(tr.order.action.upper() == side for tr in our_trades_for(ib, contract, RUN_TAG)):
                     continue
 
-                # Decide entry/flip; ensure we don't duplicate *our* same-side working orders
-                if sig == 'LONG' and state != 'LONG':
-                    # flip from short? flatten ours first (only our exposure)
-                    if state == 'SHORT' and position[s] < 0:
-                        flatten_ours(ib, contracts[s], qty=min(qty, -position[s]), side='BUY',
-                                     order_ref_prefix=order_ref_prefix, dry_run=DRY_RUN)
-                    # block duplicate BUYs from this run
-                    if any(tr.order.action.upper() == 'BUY' for tr in our_trades_for(ib, contracts[s], order_ref_prefix)):
-                        continue
-                    side = 'BUY'
-
-                elif sig == 'SHORT' and state != 'SHORT':
-                    if not ALLOW_SHORT:
-                        continue
-                    # flip from long? flatten ours first (only our exposure)
-                    if state == 'LONG' and position[s] > 0:
-                        flatten_ours(ib, contracts[s], qty=min(qty, position[s]), side='SELL',
-                                     order_ref_prefix=order_ref_prefix, dry_run=DRY_RUN)
-                    # block duplicate SELLs from this run
-                    if any(tr.order.action.upper() == 'SELL' for tr in our_trades_for(ib, contracts[s], order_ref_prefix)):
-                        continue
-                    side = 'SELL'
-                else:
-                    continue  # nothing to do
-
-                # place (DRY RUN prints only)
                 parent, tp, sl = make_bracket(ib, side, qty, mid, tp_cents, sl_cents, order_ref=order_ref)
                 stop_px = getattr(sl, 'auxPrice', getattr(sl, 'stopPrice', None))
-                print(f"✅ {s} {side} {qty} @~{mid:.2f} | TP {tp.lmtPrice} | SL {stop_px} (tp={tp_cents:.1f}c, sl={sl_cents:.1f}c) ref={order_ref}")
+                print(f"✅ {s} {side} {qty} @~{mid:.2f} | TP {tp.lmtPrice} | SL {stop_px} "
+                      f"(tp={tp_cents:.1f}c, sl={sl_cents:.1f}c) ref={order_ref}")
                 if not DRY_RUN:
-                    ib.placeOrder(contracts[s], parent); ib.placeOrder(contracts[s], tp); ib.placeOrder(contracts[s], sl)
-                # DRY bookkeeping (simulation feel)
-                position[s] += (qty if side=='BUY' else -qty)
+                    try:
+                        ib.placeOrder(contract, parent)
+                        ib.placeOrder(contract, tp)
+                        ib.placeOrder(contract, sl)
+                    except Exception as e:
+                        print(f"❌ placeOrder failed for {s}: {e}. Cancelling staged children.")
+                        try:
+                            if tp.orderId: ib.cancelOrder(tp)
+                            if sl.orderId: ib.cancelOrder(sl)
+                        except Exception:
+                            pass
+                        continue
+
+                # Arm kill-switch on first order if it isn’t already (covers very fast fills)
+                nonlocal_kill = False
+                if not kill_armed:
+                    daily_baseline = float(daily_pnl)
+                    kill_armed = True
+                    print(f"🔒 Kill-switch armed. Session baseline set to {daily_baseline:.2f}")
+
                 last_ts[s] = time.time()
 
-            # demo daily loss stop (realized not tracked in DRY_RUN)
-            if pnl_realized <= DAILY_LOSS_LIMIT:
-                pass
+            # Kill-switch: live only; active only once *armed*; flattens *our* positions
+            if (not DRY_RUN) and kill_armed:
+                session_daily = daily_pnl - daily_baseline
+                if session_daily <= DAILY_LOSS_LIMIT:
+                    print(f"⛔ Session loss limit hit (SessionDaily={session_daily:.2f} ≤ {DAILY_LOSS_LIMIT:.2f}). Flattening ours & stopping.")
+                    for s, c in contracts.items():
+                        my_qty = int(our_pos.get(s, 0))
+                        if my_qty > 0:
+                            cancel_ours(ib, c, RUN_TAG)
+                            mkt = MarketOrder('SELL', my_qty); mkt.orderRef = f"{RUN_TAG}:KILL"
+                            ib.placeOrder(c, mkt)
+                    break
 
     except KeyboardInterrupt:
-        print("\nStopping… closing any open positions.")
-        for s in SYMBOLS:
-            if abs(position[s]) > 0:
-                print(f"Closing {s} (simulated).")
-                position[s] = 0
+        print("\nStopping… CANCEL our orders & FLATTEN our positions.")
+        for s, c in contracts.items():
+            cancel_ours(ib, c, RUN_TAG)
+            my_qty = int(our_pos.get(s, 0))
+            if my_qty > 0:
+                if DRY_RUN:
+                    print(f"[DRY] FLATTEN {s}: SELL {my_qty} (ours, Ctrl+C)")
+                else:
+                    mkt = MarketOrder('SELL', my_qty); mkt.orderRef = f"{RUN_TAG}:STOP"
+                    ib.placeOrder(c, mkt)
     finally:
         try:
+            # cleanup PnL subscription
+            try:
+                if account_id:
+                    ib.cancelPnL(account_id, '')
+            except Exception:
+                pass
+            # final safety sweep for our positions only
+            for s, c in contracts.items():
+                cancel_ours(ib, c, RUN_TAG)
+                my_qty = int(our_pos.get(s, 0))
+                if my_qty > 0:
+                    if DRY_RUN:
+                        print(f"[DRY] FLATTEN {s}: SELL {my_qty} (ours, final)")
+                    else:
+                        mkt = MarketOrder('SELL', my_qty); mkt.orderRef = f"{RUN_TAG}:FINAL"
+                        ib.placeOrder(c, mkt)
             md.stop()
         except Exception:
             pass
