@@ -1,5 +1,7 @@
-# trade_algorithm.py
-# EDUCATIONAL PURPOSES ONLY — USE IBKR PAPER TRADING
+# ⚠️ EDUCATIONAL PURPOSES ONLY - PAPER TRADING ONLY
+# Never deploy with a live IBKR account without thorough testing.
+# Requires TWS or IB Gateway running locally on port 7497.
+# No API keys are stored in this file - authentication is handled by TWS.
 
 from __future__ import annotations
 from ib_insync import *
@@ -19,7 +21,7 @@ DAILY_LOSS_LIMIT        = -0.01 * HFT_SLEEVE_USD   # applies to *session* PnL on
 OPEN_NOTIONAL_MAX       = 150_000
 
 # ========= COST / TURNOVER GUARDS =========
-DRY_RUN                 = False                     # set False to place paper orders
+DRY_RUN = True                                      # SET TO FALSE ONLY AFTER REVIEWING ALL SETTINGS
 MIN_SECONDS_BETWEEN_TR  = 8.0                       # per symbol (entries only)
 MAX_TRADES_PER_MIN_SYM  = 3                         # per symbol (entries only)
 SPREAD_SKIP_TICKS       = 50.0                      # relaxed while on delayed quotes
